@@ -1,0 +1,59 @@
+{
+  "name": "llm-budget",
+  "version": "0.1.0",
+  "description": "Per-user token and dollar budgets, rate limits, and a circuit breaker for LLM API calls - usage metering from OpenAI and Anthropic responses, shared-store adapters for multi-instance SaaS, Express middleware. Zero dependencies.",
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "budget",
+    "usage-metering",
+    "rate-limit",
+    "cost-control",
+    "quota",
+    "circuit-breaker",
+    "saas",
+    "tokens"
+  ],
+  "license": "MIT",
+  "author": "Muzaffar Qosimov",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qwertymuzaffar/llm-budget.git"
+  },
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "bench": "npm run build && node scripts/bench.mjs",
+    "prepublishOnly": "npm run build && npm test",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "npm run build && changeset publish"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.2",
+    "@vitest/coverage-v8": "4.1.11",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.0.8"
+  }
+}
