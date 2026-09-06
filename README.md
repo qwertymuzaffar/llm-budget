@@ -6,6 +6,10 @@
 
 Per-user **token and dollar budgets**, **rate limits**, and a **circuit breaker** for LLM API calls - the cost-control layer every AI SaaS needs before real users touch it. Usage is metered straight from OpenAI and Anthropic responses, counters live in a shared store so every instance of your app enforces the same numbers, and one middleware turns "over budget" into a 429. Zero dependencies; Node 18+.
 
+## Why
+
+One user with a script and your API can turn a $50 month into a $5,000 one overnight. Provider dashboards show you the damage after the fact; provider rate limits protect *them*, not you. What you need is a per-user meter with a hard stop, enforced on every request across every instance of your app, with numbers your UI can show. That is the whole scope of this library.
+
 ## Install
 
 ```bash
@@ -20,8 +24,8 @@ import { Budget, MemoryStore } from 'llm-budget';
 
 const openai = new OpenAI();
 const budget = new Budget({
-  store: new MemoryStore(), // SqlStore for production - see below
-  limits: (userId) => plans[userId] ?? { usd: 5, requests: 500, window: 'month', rate: { requests: 20, perMs: 60_000 } },
+  store: new MemoryStore(), // SqlStore for production - see "Shared storage"
+  limits: { usd: 5, requests: 500, window: 'month', rate: { requests: 20, perMs: 60_000 } },
 });
 
 // checks the budget, runs the call, meters the response - or throws BudgetExceededError first
@@ -31,7 +35,7 @@ const completion = await budget.guard(userId, () =>
 );
 ```
 
-Works the same with Anthropic - usage is auto-detected from either provider's response shape:
+Anthropic works the same - usage is auto-detected from either provider's response shape:
 
 ```ts
 const message = await budget.guard(userId, () =>
@@ -39,76 +43,225 @@ const message = await budget.guard(userId, () =>
 );
 ```
 
-## What it enforces
+## Concepts
+
+**Principal** - whoever the budget belongs to: a user id, a team id, an API key. Every counter is scoped to it, so two principals never see each other's usage.
+
+**Limits** - what the principal may consume. Omit a field to leave it unlimited:
 
 | Limit | Meaning | Window |
 |---|---|---|
-| `usd` | Spend, computed from the model's price per token | `'hour'`, `'day'`, `'month'` (default), or ms |
+| `usd` | Spend, computed from the model's price per token | `'hour'`, `'day'`, `'month'` (default), or a length in ms |
 | `tokens` | Input + output tokens; `estimateTokens` is checked *before* the call | same |
 | `requests` | Model calls | same |
-| `rate` | Short-term burst control: `{ requests, perMs }`, sliding window | independent |
+| `rate` | Burst control: `{ requests, perMs }`, sliding window | independent of the budget window |
 
-Limits are per **principal** - a user id, team, or API key - and can be a constant or a resolver (sync or async), so plan tiers are one function:
+**Decision** - what `check()` and `summary()` return: for each metric, `used`, `limit`, `remaining`, and `resetsAt`, plus `allowed`, the first exceeded `reason`, and `warnings` for metrics at or past 80% (configurable with `warnAt`). It is designed to be sent straight to a usage meter in your UI.
+
+**Windows** are fixed and UTC: `'day'` resets at 00:00 UTC, `'month'` on the first of the month. Counters are keyed by principal, metric, and window, so a new window starts from zero automatically and old counters expire on their own.
+
+### How the sliding rate limit works
+
+A fixed one-minute window lets a user fire 20 requests at 0:59 and 20 more at 1:01. `rate` avoids that with the standard two-bucket approximation: the current bucket's count plus the previous bucket's count weighted by how much of the previous window still overlaps. It costs two counter reads, has no per-request log to store, and is accurate enough for abuse control (it slightly over-counts at bucket boundaries, never under-counts).
+
+## Examples
+
+### Plan tiers
+
+`limits` can be a resolver - sync or async - so tiers are one function and live wherever your plans live:
 
 ```ts
-limits: async (userId) => (await db.plan(userId)) === 'pro' ? { usd: 50 } : { usd: 2 }
+const budget = new Budget({
+  store,
+  limits: async (userId) => {
+    const plan = await db.planFor(userId);
+    return plan === 'pro'
+      ? { usd: 50, window: 'month', rate: { requests: 60, perMs: 60_000 } }
+      : { usd: 2, requests: 100, window: 'month', rate: { requests: 10, perMs: 60_000 } };
+  },
+});
 ```
 
-A `Decision` from `check()` / `summary()` reports `used`, `limit`, `remaining`, and `resetsAt` for every metric plus `warnings` at 80% (configurable) - what a usage meter in your UI needs.
+### Showing users where they stand
+
+```ts
+const d = await budget.summary(userId);
+
+render({
+  spentPercent: d.usd.limit ? Math.round((100 * d.usd.used) / d.usd.limit) : null,
+  resetsAt: new Date(d.usd.resetsAt),
+  nearLimit: d.warnings.includes('usd'),
+});
+```
+
+### Team budget plus per-user rate limit
+
+Budgets compose: run a check against the team, then guard against the user, and record to both.
+
+```ts
+const team = new Budget({ store, limits: { usd: 500, window: 'month' }, prefix: 'team' });
+const user = new Budget({ store, limits: { rate: { requests: 30, perMs: 60_000 } }, prefix: 'user' });
+
+const teamDecision = await team.check(teamId, estimate);
+if (!teamDecision.allowed) throw new BudgetExceededError(teamId, teamDecision.reason!, teamDecision);
+
+const result = await user.guard(userId, () => openai.chat.completions.create(...), { estimateTokens: estimate });
+await team.record(teamId, fromOpenAI(result)!);
+```
+
+### Estimating tokens before the call
+
+`estimateTokens` is what lets the token budget stop a huge prompt *before* it costs anything. A cheap estimate is enough - the exact count is metered from the response afterwards:
+
+```ts
+const estimate = Math.ceil(promptText.length / 4) + maxOutputTokens;
+await budget.guard(userId, call, { estimateTokens: estimate });
+```
+
+For exact counts use a tokenizer such as `js-tiktoken`; for chunked documents, [chunklet](https://www.npmjs.com/package/chunklet) reports `tokens` per chunk.
+
+### Streaming
+
+Streams deliver usage at the end. Ask the provider to include it and record it when the stream finishes:
+
+```ts
+const decision = await budget.check(userId, estimate);
+if (!decision.allowed) return res.status(429).json({ reason: decision.reason });
+
+const stream = await openai.chat.completions.create({ model, messages, stream: true, stream_options: { include_usage: true } });
+let finalChunk;
+for await (const chunk of stream) {
+  finalChunk = chunk;
+  // forward chunk to the client
+}
+await budget.record(userId, fromOpenAI(finalChunk)!); // the last chunk carries `usage`
+```
+
+With Anthropic, accumulate `message_start` input tokens and `message_delta` output tokens into a `Usage` object and pass it to `record()`.
+
+### Handling the error in an API route
+
+```ts
+try {
+  const result = await budget.guard(req.user.id, () => openai.chat.completions.create(...));
+  res.json(result);
+} catch (e) {
+  if (e instanceof BudgetExceededError) {
+    res.setHeader('Retry-After', Math.ceil((e.decision[e.reason].resetsAt - Date.now()) / 1000));
+    return res.status(429).json({ error: 'budget exceeded', reason: e.reason, resetsAt: e.decision[e.reason].resetsAt });
+  }
+  throw e;
+}
+```
+
+Or let the middleware do it (see below).
+
+### Testing your own code
+
+Inject a clock; every window and rate computation uses it, so tests never sleep:
+
+```ts
+let now = Date.parse('2026-01-01T00:00:00Z');
+const budget = new Budget({ store: new MemoryStore(() => now), limits: { requests: 1, window: 'day' }, clock: () => now });
+
+await budget.record('u', { model: 'gpt-4o', inputTokens: 1, outputTokens: 1 });
+expect((await budget.check('u')).allowed).toBe(false);
+now += 86_400_000; // next day
+expect((await budget.check('u')).allowed).toBe(true);
+```
 
 ## Pricing
 
 A built-in table covers current OpenAI and Anthropic models (list prices per 1M tokens, dated in the source). Prices change, so override or extend it:
 
 ```ts
-new Budget({ store, limits, prices: { 'gpt-4o': { input: 2.5, output: 10, cachedInput: 1.25 }, 'my-finetune': { input: 3, output: 12 } } });
+new Budget({
+  store,
+  limits,
+  prices: {
+    'gpt-4o': { input: 2.5, output: 10, cachedInput: 1.25 },
+    'my-finetune': { input: 3, output: 12 },
+  },
+});
 ```
 
-Dated snapshots and provider prefixes resolve automatically (`openai/gpt-4o-2024-11-20` → `gpt-4o`). Cached prompt tokens are billed at the cached rate. Unknown models record at $0 by default; set `unknownModel: 'throw'` to refuse them.
+Model ids resolve leniently: provider prefixes and dated snapshots (`openai/gpt-4o-2024-11-20`) map to the base price. Cached prompt tokens are billed at the cached rate when the table has one. Unknown models record at $0 (`unpriced: true` in the `record()` result) by default; set `unknownModel: 'throw'` to refuse them.
 
 ## Shared storage
 
-Budgets only work if every instance sees the same counters. Bring your own database client:
+Budgets only work if every instance sees the same counters. `MemoryStore` is for development, tests, and single-process apps. For production, bring your own database client:
 
 ```ts
 import { Pool } from 'pg';
 import { Budget, SqlStore, sqlStoreSchema } from 'llm-budget';
 
 const pool = new Pool();
-await pool.query(sqlStoreSchema()); // one table, run once as a migration
+await pool.query(sqlStoreSchema()); // one table - run it once as a migration
+
 const budget = new Budget({ store: new SqlStore((sql, params) => pool.query(sql, params)), limits });
 ```
 
-`SqlStore` uses one atomic upsert per increment (PostgreSQL syntax). Any store is a two-method interface - `get(key)` and `increment(key, by, ttlMs)` - so Redis or DynamoDB adapters are a few lines.
+`SqlStore` does one atomic `INSERT ... ON CONFLICT` per increment (PostgreSQL syntax), so concurrent instances never lose updates. Expired rows are ignored on read; sweep them on a schedule (`DELETE FROM llm_budget_counters WHERE expires_at < :now`).
+
+Any store is a two-method interface:
+
+```ts
+interface BudgetStore {
+  get(key: string): Promise<number>;
+  increment(key: string, by: number, ttlMs?: number): Promise<number>; // returns the new value
+}
+```
+
+A Redis adapter is `INCRBYFLOAT` + `PEXPIRE`; DynamoDB is an `ADD` update expression. Keys look like `llmb:<principal>:<metric>:<window>`.
 
 ## Middleware
 
 ```ts
-import { budgetMiddleware } from 'llm-budget';
+import { budgetMiddleware, fromOpenAI } from 'llm-budget';
 
-app.post('/api/generate', budgetMiddleware(budget, { principal: (req) => req.user?.id }), async (req, res) => {
-  const result = await openai.chat.completions.create(...);
-  await budget.record(req.user.id, fromOpenAI(result)!);
-  res.json(result);
-});
+app.post(
+  '/api/generate',
+  budgetMiddleware(budget, {
+    principal: (req) => req.user?.id,
+    estimateTokens: (req) => Math.ceil(String(req.body.prompt ?? '').length / 4) + 500,
+  }),
+  async (req, res) => {
+    const result = await openai.chat.completions.create(...);
+    await budget.record(req.user.id, fromOpenAI(result)!);
+    res.json(result);
+  },
+);
 ```
 
-Over budget → `429` with `{ error, reason, resetsAt }` and a `Retry-After` header; near a limit → `X-Budget-Warning`. The decision is available as `req.budget`.
+Over budget → `429` with `{ error, reason, resetsAt }` and a `Retry-After` header. Near a limit → an `X-Budget-Warning` header. No principal → `401`. The decision is available as `req.budget`. The middleware only needs `headers`, `status()`, `setHeader()`, and `json()`, so it fits Express, Fastify's compatibility layer, and most Node frameworks.
 
 ## Circuit breaker
+
+When a provider is down, retrying from every request makes the outage worse and burns your error budget. The breaker fails fast instead:
 
 ```ts
 import { CircuitBreaker } from 'llm-budget';
 
-const breaker = new CircuitBreaker({ failureThreshold: 5, cooldownMs: 30_000, shouldTrip: (e) => e.status >= 500 });
+const breaker = new CircuitBreaker({
+  failureThreshold: 5,   // consecutive failures that open the circuit
+  cooldownMs: 30_000,    // fail fast this long, then allow one trial call
+  shouldTrip: (e) => (e as { status?: number }).status === undefined || e.status >= 500, // ignore 4xx
+});
+
 const result = await budget.guard(userId, () => breaker.run(() => openai.chat.completions.create(...)));
 ```
 
-After the threshold of consecutive provider failures the circuit opens and calls fail fast with `CircuitOpenError` until the cooldown passes; one trial call then decides whether it closes.
+States: `closed` (normal) → `open` after the threshold → `half-open` after the cooldown, where one trial call either closes the circuit or re-opens it. Calls rejected while open throw `CircuitOpenError` with `retryAt`. Failed calls are never recorded against the budget.
 
 ## Performance
 
-`npm run bench` - 10,000 principals, 200,000 check+record cycles on `MemoryStore` (Apple silicon, Node 20): **~208,000 cycles/s (4.8 µs each)**, 410,000 summary reads/s. With `SqlStore` the cost is one round trip per counter; run checks in parallel where latency matters.
+`npm run bench` - 10,000 principals, 200,000 check+record cycles on `MemoryStore` (Apple silicon, Node 20): **~208,000 cycles/s (4.8 µs each)**, 410,000 summary reads/s. With `SqlStore` the cost is one database round trip per counter; the reads in `check()` run in parallel.
+
+## Design notes
+
+- **Record after, not reserve before.** Usage is metered from the real response, so counters are exact; the trade-off is that one in-flight call can overshoot a limit by its own size. `estimateTokens` narrows that gap for the token budget. Reservations are on the roadmap.
+- **Floating-point dollars.** Costs are summed as doubles in the store; at the scale of per-user budgets the error is far below a cent. Bill from your provider invoice, not from these counters.
+- **Failed calls cost nothing.** If the provider throws, nothing is recorded - but the rate bucket is also not incremented, so retries are not throttled by the budget. Use the circuit breaker for that.
 
 ## API
 
@@ -120,20 +273,25 @@ After the threshold of consecutive provider failures the circuit opens and calls
 | `CircuitBreaker` | Fail-fast wrapper for provider calls |
 | `fromOpenAI(res)`, `fromAnthropic(res)`, `detectUsage(res)` | Usage extractors (`Usage` = `{ model, inputTokens, outputTokens, cachedInputTokens? }`) |
 | `costOf(usage, prices)`, `resolvePrice(model, prices)`, `DEFAULT_PRICES` | Pricing helpers |
-| `BudgetExceededError`, `UnknownModelError`, `CircuitOpenError` | Typed errors with `reason` / `decision` / `retryAt` |
+| `windowBounds(window, now)`, `windowKey(window, now)` | Window math, if you need it elsewhere |
+| `BudgetExceededError`, `UnknownModelError`, `CircuitOpenError` | Typed errors carrying `reason` / `decision` / `retryAt` |
 
-Streaming: enable `stream_options: { include_usage: true }` (OpenAI) and pass the final chunk, or Anthropic's `message_delta` usage, to `record()`.
+### Budget options
+
+| Option | Default | Description |
+|---|---|---|
+| `store` | required | `BudgetStore` implementation |
+| `limits` | required | `Limits` or `(principal) => Limits \| Promise<Limits>` |
+| `prices` | built-in table | Merged over the defaults |
+| `warnAt` | `0.8` | Warning threshold as a fraction of each limit |
+| `unknownModel` | `'zero'` | `'zero'` records at $0, `'throw'` rejects |
+| `clock` | `Date.now` | Injectable time source |
+| `prefix` | `'llmb'` | Store key prefix - use different prefixes for different budgets sharing one store |
 
 ## Alternatives
 
 - [llm-meter](https://www.npmjs.com/package/llm-meter) - token tracking, cost management, and caching for a single process. llm-budget focuses on multi-tenant enforcement: per-principal plans, shared stores across instances, middleware, and a circuit breaker; no caching.
 - [llm-limiter](https://www.npmjs.com/package/llm-limiter) - protects you from the *provider's* RPM/TPM limits with token-aware reservation. Complementary: llm-limiter keeps you under OpenAI's ceiling, llm-budget keeps each of your users under yours.
-
-## Roadmap
-
-- Redis store adapter
-- Usage export for billing (`usageSince(principal, from)`)
-- Streaming helpers that meter as chunks arrive
 
 ## License
 
