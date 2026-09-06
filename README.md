@@ -122,22 +122,61 @@ For exact counts use a tokenizer such as `js-tiktoken`; for chunked documents, [
 
 ### Streaming
 
-Streams deliver usage at the end. Ask the provider to include it and record it when the stream finishes:
+Streams deliver usage at the end. `budget.meter()` passes the stream through and records once it completes - OpenAI's final chunk (enable `stream_options.include_usage`) or Anthropic's `message_start` + `message_delta` events are both understood:
 
 ```ts
 const decision = await budget.check(userId, estimate);
 if (!decision.allowed) return res.status(429).json({ reason: decision.reason });
 
 const stream = await openai.chat.completions.create({ model, messages, stream: true, stream_options: { include_usage: true } });
-let finalChunk;
-for await (const chunk of stream) {
-  finalChunk = chunk;
-  // forward chunk to the client
+for await (const chunk of budget.meter(userId, stream)) {
+  res.write(chunk.choices[0]?.delta?.content ?? '');
 }
-await budget.record(userId, fromOpenAI(finalChunk)!); // the last chunk carries `usage`
 ```
 
-With Anthropic, accumulate `message_start` input tokens and `message_delta` output tokens into a `Usage` object and pass it to `record()`.
+A stream that throws is not charged. `meterStream(stream, onUsage)` and `StreamUsageTracker` are exported for custom pipelines.
+
+### Reservations: no overshoot under concurrency
+
+`guard()` normally checks first and records after, so one in-flight call can overshoot a limit by its own size - and ten concurrent calls can overshoot by ten sizes. Reservations close that gap: the estimate is charged *before* the call with atomic increments, rolled back if the totals exceed a limit, then settled to the real usage afterwards.
+
+```ts
+const result = await budget.guard(userId, () => openai.chat.completions.create({ model: 'gpt-4o-mini', messages, max_tokens: 500 }), {
+  reserve: { model: 'gpt-4o-mini', inputTokens: Math.ceil(promptText.length / 4), outputTokens: 500 },
+});
+// on success: settled to the response's real usage; on error: released in full
+```
+
+The primitives are public for manual control:
+
+```ts
+const reservation = await budget.reserve(userId, estimate); // throws BudgetExceededError if it does not fit
+try {
+  const result = await call();
+  await budget.settle(reservation, fromOpenAI(result)!);
+} catch (e) {
+  await budget.release(reservation);
+  throw e;
+}
+```
+
+Settlement is charged to the window the reservation was made in, even if the window rolled over mid-call.
+
+### A ledger for billing
+
+Counters only hold window totals. For invoices, audits, or usage exports, subscribe to every metered call and write it wherever you keep money:
+
+```ts
+const budget = new Budget({
+  store,
+  limits,
+  onRecord: async ({ principal, usage, cost, unpriced, at }) => {
+    await db.insert('llm_usage', { userId: principal, model: usage.model, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, costUsd: cost, unpriced, at: new Date(at) });
+  },
+});
+```
+
+`onRecord` fires after `record()` and after `settle()` (with the real usage, not the estimate).
 
 ### Handling the error in an API route
 
@@ -203,16 +242,27 @@ const budget = new Budget({ store: new SqlStore((sql, params) => pool.query(sql,
 
 `SqlStore` does one atomic `INSERT ... ON CONFLICT` per increment (PostgreSQL syntax), so concurrent instances never lose updates. Expired rows are ignored on read; sweep them on a schedule (`DELETE FROM llm_budget_counters WHERE expires_at < :now`).
 
-Any store is a two-method interface:
+Redis works with either popular client, no adapter code needed:
+
+```ts
+import { createClient } from 'redis'; // or ioredis
+import { Budget, RedisStore } from 'llm-budget';
+
+const client = createClient({ url: process.env.REDIS_URL });
+await client.connect();
+const budget = new Budget({ store: new RedisStore(client), limits });
+```
+
+`RedisStore` uses `INCRBYFLOAT` for atomic increments and `PEXPIRE` for window expiry. Any other store is a two-method interface:
 
 ```ts
 interface BudgetStore {
   get(key: string): Promise<number>;
-  increment(key: string, by: number, ttlMs?: number): Promise<number>; // returns the new value
+  increment(key: string, by: number, ttlMs?: number): Promise<number>; // returns the new value - must be atomic
 }
 ```
 
-A Redis adapter is `INCRBYFLOAT` + `PEXPIRE`; DynamoDB is an `ADD` update expression. Keys look like `llmb:<principal>:<metric>:<window>`.
+DynamoDB is an `ADD` update expression. Keys look like `llmb:<principal>:<metric>:<window>`.
 
 ## Middleware
 
@@ -255,11 +305,11 @@ States: `closed` (normal) → `open` after the threshold → `half-open` after t
 
 ## Performance
 
-`npm run bench` - 10,000 principals, 200,000 check+record cycles on `MemoryStore` (Apple silicon, Node 20): **~208,000 cycles/s (4.8 µs each)**, 410,000 summary reads/s. With `SqlStore` the cost is one database round trip per counter; the reads in `check()` run in parallel.
+`npm run bench` - 10,000 principals, 200,000 check+record cycles on `MemoryStore` (Apple silicon, Node 20): **~164,000 cycles/s (6.1 µs each)**, 340,000 summary reads/s. With `SqlStore` or `RedisStore` the cost is one round trip per counter; the reads in `check()` run in parallel.
 
 ## Design notes
 
-- **Record after, not reserve before.** Usage is metered from the real response, so counters are exact; the trade-off is that one in-flight call can overshoot a limit by its own size. `estimateTokens` narrows that gap for the token budget. Reservations are on the roadmap.
+- **Check-then-record by default; reserve when it matters.** `guard()` meters real usage, so counters are exact, but one in-flight call can overshoot a limit by its own size and concurrent calls compound that. `estimateTokens` narrows the gap; `reserve` removes it at the cost of an estimate up front.
 - **Floating-point dollars.** Costs are summed as doubles in the store; at the scale of per-user budgets the error is far below a cent. Bill from your provider invoice, not from these counters.
 - **Failed calls cost nothing.** If the provider throws, nothing is recorded - but the rate bucket is also not incremented, so retries are not throttled by the budget. Use the circuit breaker for that.
 
@@ -267,8 +317,9 @@ States: `closed` (normal) → `open` after the threshold → `half-open` after t
 
 | Export | Description |
 |---|---|
-| `new Budget(options)` | `check(principal, estimateTokens?)`, `record(principal, usage)`, `guard(principal, fn, options?)`, `summary(principal)` |
-| `MemoryStore`, `SqlStore`, `sqlStoreSchema()` | Stores; implement `BudgetStore` for others |
+| `new Budget(options)` | `check`, `record`, `guard`, `summary`, `reserve` / `settle` / `release`, `meter(principal, stream)` |
+| `MemoryStore`, `SqlStore`, `sqlStoreSchema()`, `RedisStore` | Stores; implement `BudgetStore` for others |
+| `meterStream(stream, onUsage)`, `StreamUsageTracker` | Streaming usage helpers |
 | `budgetMiddleware(budget, options)` | Express-compatible 429 guard |
 | `CircuitBreaker` | Fail-fast wrapper for provider calls |
 | `fromOpenAI(res)`, `fromAnthropic(res)`, `detectUsage(res)` | Usage extractors (`Usage` = `{ model, inputTokens, outputTokens, cachedInputTokens? }`) |
@@ -287,6 +338,7 @@ States: `closed` (normal) → `open` after the threshold → `half-open` after t
 | `unknownModel` | `'zero'` | `'zero'` records at $0, `'throw'` rejects |
 | `clock` | `Date.now` | Injectable time source |
 | `prefix` | `'llmb'` | Store key prefix - use different prefixes for different budgets sharing one store |
+| `onRecord` | - | Ledger hook called after every `record()` / `settle()` |
 
 ## Alternatives
 

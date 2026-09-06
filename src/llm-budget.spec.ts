@@ -17,7 +17,8 @@ import {
   windowKey,
   DEFAULT_PRICES,
 } from './index';
-import type { Decision, SqlQuery } from './index';
+import { RedisStore, StreamUsageTracker, meterStream } from './index';
+import type { Decision, LedgerEntry, SqlQuery, Usage } from './index';
 
 /** Controllable clock starting at a fixed UTC instant. */
 function fakeClock(startIso = '2026-09-06T12:00:00Z') {
@@ -210,6 +211,181 @@ describe('Budget', () => {
     expect((await budget.summary('u1')).tokens.used).toBe(42);
     await budget.guard('u1', async () => 'no usage here');
     expect((await budget.summary('u1')).requests.used).toBe(1);
+  });
+});
+
+describe('reservations', () => {
+  function setup(limits: ConstructorParameters<typeof Budget>[0]['limits'], onRecord?: (e: LedgerEntry) => void) {
+    const time = fakeClock();
+    const store = new MemoryStore(time.clock);
+    const budget = new Budget({ store, limits, clock: time.clock, onRecord });
+    return { budget, store, time };
+  }
+  const est: Usage = { model: 'gpt-4o-mini', inputTokens: 1000, outputTokens: 500 };
+
+  it('reserve charges the estimate; settle adjusts to actual usage', async () => {
+    const { budget } = setup({ tokens: 10_000, usd: 1 });
+    const r = await budget.reserve('u1', est);
+    expect((await budget.summary('u1')).tokens.used).toBe(1500);
+    expect((await budget.summary('u1')).requests.used).toBe(1);
+    await budget.settle(r, { model: 'gpt-4o-mini', inputTokens: 1000, outputTokens: 120 });
+    const s = await budget.summary('u1');
+    expect(s.tokens.used).toBe(1120);
+    expect(s.requests.used).toBe(1);
+    expect(s.usd.used).toBeCloseTo((1000 * 0.15 + 120 * 0.6) / 1_000_000, 10);
+  });
+
+  it('release gives everything back, including the rate bucket', async () => {
+    const { budget } = setup({ requests: 5, rate: { requests: 2, perMs: 60_000 } });
+    const r = await budget.reserve('u1', est);
+    expect((await budget.summary('u1')).rate.used).toBe(1);
+    await budget.release(r);
+    const s = await budget.summary('u1');
+    expect(s.requests.used).toBe(0);
+    expect(s.tokens.used).toBe(0);
+    expect(s.rate.used).toBe(0);
+  });
+
+  it('reserve refuses an estimate that does not fit', async () => {
+    const { budget } = setup({ tokens: 1000 });
+    await expect(budget.reserve('u1', est)).rejects.toBeInstanceOf(BudgetExceededError);
+    expect((await budget.summary('u1')).tokens.used).toBe(0);
+  });
+
+  it('concurrent reservations cannot collectively overshoot', async () => {
+    const { budget } = setup({ tokens: 4000 });
+    const results = await Promise.allSettled([1, 2, 3, 4].map(() => budget.reserve('u1', est)));
+    const ok = results.filter((r) => r.status === 'fulfilled').length;
+    expect(ok).toBe(2); // 2 x 1500 fits, the third would exceed 4000
+    expect((await budget.summary('u1')).tokens.used).toBe(3000);
+  });
+
+  it('guard with reserve settles on success and releases on failure', async () => {
+    const entries: LedgerEntry[] = [];
+    const { budget } = setup({ usd: 1 }, (e) => { entries.push(e); });
+    await budget.guard('u1', async () => openaiResponse(1000, 100), { reserve: est });
+    expect((await budget.summary('u1')).tokens.used).toBe(1100);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].usage.outputTokens).toBe(100);
+
+    await expect(budget.guard('u1', async () => { throw new Error('down'); }, { reserve: est })).rejects.toThrow('down');
+    expect((await budget.summary('u1')).tokens.used).toBe(1100);
+    expect(entries).toHaveLength(1);
+  });
+
+  it('guard with reserve keeps the estimate when the result carries no usage', async () => {
+    const { budget } = setup({ usd: 1 });
+    await budget.guard('u1', async () => 'opaque', { reserve: est });
+    expect((await budget.summary('u1')).tokens.used).toBe(1500);
+  });
+
+  it('settlement lands in the reserved window even after a rollover', async () => {
+    const { budget, time } = setup({ tokens: 10_000, window: 'hour' });
+    const r = await budget.reserve('u1', est);
+    time.advance(60 * 60 * 1000 + 1);
+    await budget.settle(r, { model: 'gpt-4o-mini', inputTokens: 1000, outputTokens: 10 });
+    expect((await budget.summary('u1')).tokens.used).toBe(0); // new window is untouched
+  });
+});
+
+describe('ledger hook', () => {
+  it('emits an entry per record with cost and timestamp', async () => {
+    const time = fakeClock();
+    const entries: LedgerEntry[] = [];
+    const budget = new Budget({ store: new MemoryStore(time.clock), limits: {}, clock: time.clock, onRecord: (e) => { entries.push(e); } });
+    await budget.record('u1', { model: 'gpt-4o', inputTokens: 100, outputTokens: 10 });
+    await budget.record('u1', { model: 'unknown-model', inputTokens: 1, outputTokens: 1 });
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toEqual(expect.objectContaining({ principal: 'u1', at: time.clock(), unpriced: false }));
+    expect(entries[0].cost).toBeCloseTo((100 * 2.5 + 10 * 10) / 1_000_000, 10);
+    expect(entries[1].unpriced).toBe(true);
+  });
+});
+
+describe('streaming', () => {
+  async function* openaiChunks() {
+    yield { model: 'gpt-4o-mini', choices: [{ delta: { content: 'Hel' } }], usage: null };
+    yield { model: 'gpt-4o-mini', choices: [{ delta: { content: 'lo' } }], usage: null };
+    yield { model: 'gpt-4o-mini', choices: [], usage: { prompt_tokens: 12, completion_tokens: 2 } };
+  }
+  async function* anthropicEvents() {
+    yield { type: 'message_start', message: { model: 'claude-sonnet-4-6', usage: { input_tokens: 25, output_tokens: 1, cache_read_input_tokens: 5 } } };
+    yield { type: 'content_block_delta', delta: { text: 'Hi' } };
+    yield { type: 'message_delta', usage: { output_tokens: 9 } };
+    yield { type: 'message_stop' };
+  }
+
+  it('tracks OpenAI usage from the final chunk', () => {
+    const t = new StreamUsageTracker();
+    t.observe({ model: 'gpt-4o-mini', usage: null });
+    expect(t.result()).toBeNull();
+    t.observe({ model: 'gpt-4o-mini', usage: { prompt_tokens: 12, completion_tokens: 2 } });
+    expect(t.result()).toEqual({ model: 'gpt-4o-mini', inputTokens: 12, outputTokens: 2 });
+  });
+
+  it('accumulates Anthropic message_start and message_delta', async () => {
+    const t = new StreamUsageTracker();
+    for await (const e of anthropicEvents()) t.observe(e);
+    expect(t.result()).toEqual({ model: 'claude-sonnet-4-6', inputTokens: 30, outputTokens: 9, cachedInputTokens: 5 });
+  });
+
+  it('meterStream passes events through and reports usage at the end', async () => {
+    let seen: Usage | null | undefined;
+    const events: unknown[] = [];
+    for await (const e of meterStream(openaiChunks(), (u) => { seen = u; })) events.push(e);
+    expect(events).toHaveLength(3);
+    expect(seen).toEqual({ model: 'gpt-4o-mini', inputTokens: 12, outputTokens: 2 });
+  });
+
+  it('meterStream does not report usage when the stream throws', async () => {
+    let called = false;
+    async function* failing() { yield { model: 'x', usage: { prompt_tokens: 1, completion_tokens: 1 } }; throw new Error('cut'); }
+    await expect((async () => { for await (const _ of meterStream(failing(), () => { called = true; })) { /* consume */ } })()).rejects.toThrow('cut');
+    expect(called).toBe(false);
+  });
+
+  it('budget.meter records the completed stream', async () => {
+    const time = fakeClock();
+    const budget = new Budget({ store: new MemoryStore(time.clock), limits: { usd: 1 }, clock: time.clock });
+    let text = '';
+    for await (const chunk of budget.meter('u1', openaiChunks())) text += (chunk as { choices: { delta: { content?: string } }[] }).choices[0]?.delta?.content ?? '';
+    expect(text).toBe('Hello');
+    const s = await budget.summary('u1');
+    expect(s.tokens.used).toBe(14);
+    expect(s.requests.used).toBe(1);
+  });
+});
+
+describe('RedisStore', () => {
+  function fakeRedis(style: 'node-redis' | 'ioredis') {
+    const data = new Map<string, number>();
+    const ttls = new Map<string, number>();
+    const base = { get: async (k: string) => (data.has(k) ? String(data.get(k)) : null) };
+    const incr = async (k: string, by: number | string) => { const v = (data.get(k) ?? 0) + Number(by); data.set(k, v); return String(v); };
+    const exp = async (k: string, ms: number) => { ttls.set(k, ms); return 1; };
+    const client = style === 'node-redis' ? { ...base, incrByFloat: incr, pExpire: exp } : { ...base, incrbyfloat: incr, pexpire: exp };
+    return { client, data, ttls };
+  }
+
+  it.each(['node-redis', 'ioredis'] as const)('works with a %s-style client', async (style) => {
+    const { client, ttls } = fakeRedis(style);
+    const store = new RedisStore(client);
+    expect(await store.get('k')).toBe(0);
+    expect(await store.increment('k', 1.5, 5000)).toBe(1.5);
+    expect(await store.increment('k', 2)).toBe(3.5);
+    expect(await store.get('k')).toBe(3.5);
+    expect(ttls.get('k')).toBe(5000);
+  });
+
+  it('rejects clients without an increment command', () => {
+    expect(() => new RedisStore({ get: async () => null })).toThrow(TypeError);
+  });
+
+  it('drives a Budget end to end', async () => {
+    const { client } = fakeRedis('node-redis');
+    const budget = new Budget({ store: new RedisStore(client), limits: { requests: 1 } });
+    await budget.record('u', { model: 'gpt-4o', inputTokens: 1, outputTokens: 1 });
+    expect((await budget.check('u')).allowed).toBe(false);
   });
 });
 

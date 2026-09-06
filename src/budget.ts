@@ -1,4 +1,5 @@
 import { costOf, DEFAULT_PRICES } from './pricing';
+import { meterStream } from './stream';
 import { detectUsage } from './usage';
 import { windowBounds, windowKey } from './windows';
 import type {
@@ -8,10 +9,12 @@ import type {
   Clock,
   Decision,
   GuardOptions,
+  LedgerEntry,
   Limits,
   MetricState,
   PriceTable,
   RecordResult,
+  Reservation,
   Usage,
 } from './types';
 
@@ -34,6 +37,7 @@ export class UnknownModelError extends Error {
 }
 
 const RATE_BUCKET_TTL_FACTOR = 2;
+const total = (u: Usage) => u.inputTokens + u.outputTokens;
 
 /**
  * Per-principal budgets and rate limits for model calls, backed by a
@@ -47,6 +51,7 @@ export class Budget {
   private readonly unknownModel: 'zero' | 'throw';
   private readonly clock: Clock;
   private readonly prefix: string;
+  private readonly onRecord?: (entry: LedgerEntry) => void | Promise<void>;
 
   constructor(options: BudgetOptions) {
     this.store = options.store;
@@ -56,6 +61,7 @@ export class Budget {
     this.unknownModel = options.unknownModel ?? 'zero';
     this.clock = options.clock ?? Date.now;
     this.prefix = options.prefix ?? 'llmb';
+    this.onRecord = options.onRecord;
   }
 
   private key(principal: string, metric: string, window: string): string {
@@ -129,49 +135,175 @@ export class Budget {
     return decision;
   }
 
-  /** Records a completed call's usage and cost against the principal. */
-  async record(principal: string, usage: Usage): Promise<RecordResult> {
+  private priceOf(usage: Usage): { cost: number; unpriced: boolean } {
+    const cost = costOf(usage, this.prices);
+    if (cost !== null) return { cost, unpriced: false };
+    if (this.unknownModel === 'throw') throw new UnknownModelError(usage.model);
+    return { cost: 0, unpriced: true };
+  }
+
+  /** Applies deltas to a window's counters (and optionally a rate bucket). */
+  private async apply(
+    principal: string,
+    wk: string,
+    ttl: number,
+    deltas: { tokens: number; usd: number; requests: number },
+    rateBucket?: { key: string; delta: number; ttl: number },
+  ): Promise<void> {
+    const writes: Promise<number>[] = [];
+    if (deltas.tokens !== 0) writes.push(this.store.increment(this.key(principal, 'tokens', wk), deltas.tokens, ttl));
+    if (deltas.usd !== 0) writes.push(this.store.increment(this.key(principal, 'usd', wk), deltas.usd, ttl));
+    if (deltas.requests !== 0) writes.push(this.store.increment(this.key(principal, 'requests', wk), deltas.requests, ttl));
+    if (rateBucket && rateBucket.delta !== 0) writes.push(this.store.increment(rateBucket.key, rateBucket.delta, rateBucket.ttl));
+    await Promise.all(writes);
+  }
+
+  private async windowFor(principal: string): Promise<{ wk: string; ttl: number; rateBucket?: { key: string; ttl: number } }> {
     const limits = await this.resolveLimits(principal);
     const window = limits.window ?? 'month';
     const now = this.clock();
     const { end } = windowBounds(window, now);
-    const wk = windowKey(window, now);
-    const ttl = Math.max(1, end - now);
-
-    let cost = costOf(usage, this.prices);
-    let unpriced = false;
-    if (cost === null) {
-      if (this.unknownModel === 'throw') throw new UnknownModelError(usage.model);
-      cost = 0;
-      unpriced = true;
-    }
-
-    const writes: Promise<number>[] = [
-      this.store.increment(this.key(principal, 'tokens', wk), usage.inputTokens + usage.outputTokens, ttl),
-      this.store.increment(this.key(principal, 'usd', wk), cost, ttl),
-      this.store.increment(this.key(principal, 'requests', wk), 1, ttl),
-    ];
+    const out: { wk: string; ttl: number; rateBucket?: { key: string; ttl: number } } = {
+      wk: windowKey(window, now),
+      ttl: Math.max(1, end - now),
+    };
     if (limits.rate) {
       const perMs = limits.rate.perMs ?? 60_000;
       const bucket = Math.floor(now / perMs) * perMs;
-      writes.push(this.store.increment(this.key(principal, 'rate', String(bucket)), 1, perMs * RATE_BUCKET_TTL_FACTOR));
+      out.rateBucket = { key: this.key(principal, 'rate', String(bucket)), ttl: perMs * RATE_BUCKET_TTL_FACTOR };
     }
-    await Promise.all(writes);
+    return out;
+  }
+
+  private async ledger(principal: string, usage: Usage, cost: number, unpriced: boolean): Promise<void> {
+    if (this.onRecord) await this.onRecord({ principal, usage, cost, unpriced, at: this.clock() });
+  }
+
+  /** Records a completed call's usage and cost against the principal. */
+  async record(principal: string, usage: Usage): Promise<RecordResult> {
+    const { cost, unpriced } = this.priceOf(usage);
+    const { wk, ttl, rateBucket } = await this.windowFor(principal);
+    await this.apply(
+      principal,
+      wk,
+      ttl,
+      { tokens: total(usage), usd: cost, requests: 1 },
+      rateBucket ? { ...rateBucket, delta: 1 } : undefined,
+    );
+    await this.ledger(principal, usage, cost, unpriced);
     return { usage, cost, unpriced };
+  }
+
+  /**
+   * Charges an estimate up front so concurrent calls cannot collectively
+   * overshoot a limit. The increments happen first (atomic in the store)
+   * and are rolled back if the returned totals exceed a limit, so two
+   * instances reserving at the same instant cannot both squeeze through.
+   * Throws BudgetExceededError if the estimate does not fit. Pair with
+   * settle() (real usage) or release() (call failed).
+   */
+  async reserve(principal: string, estimate: Usage): Promise<Reservation> {
+    const limits = await this.resolveLimits(principal);
+    const { cost } = this.priceOf(estimate);
+    const { wk, ttl, rateBucket } = await this.windowFor(principal);
+    const reservation: Reservation = {
+      principal,
+      estimate,
+      cost,
+      windowKey: wk,
+      ttlMs: ttl,
+      ...(rateBucket ? { rateBucket: rateBucket.key } : {}),
+    };
+
+    const [tokens, usd, requests, rateCurrent] = await Promise.all([
+      this.store.increment(this.key(principal, 'tokens', wk), total(estimate), ttl),
+      this.store.increment(this.key(principal, 'usd', wk), cost, ttl),
+      this.store.increment(this.key(principal, 'requests', wk), 1, ttl),
+      rateBucket ? this.store.increment(rateBucket.key, 1, rateBucket.ttl) : Promise.resolve(0),
+    ]);
+
+    let reason: BudgetReason | null = null;
+    if (limits.rate && rateBucket) {
+      const perMs = limits.rate.perMs ?? 60_000;
+      const now = this.clock();
+      const current = Math.floor(now / perMs) * perMs;
+      const prev = await this.store.get(this.key(principal, 'rate', String(current - perMs)));
+      const used = rateCurrent + prev * (1 - (now - current) / perMs);
+      if (used > limits.rate.requests) reason = 'rate';
+    }
+    if (!reason && limits.requests !== undefined && requests > limits.requests) reason = 'requests';
+    if (!reason && limits.usd !== undefined && usd > limits.usd) reason = 'usd';
+    if (!reason && limits.tokens !== undefined && tokens > limits.tokens) reason = 'tokens';
+
+    if (reason) {
+      await this.release(reservation);
+      throw new BudgetExceededError(principal, reason, await this.check(principal, total(estimate)));
+    }
+    return reservation;
+  }
+
+  /** Replaces a reservation's estimate with the real usage (deltas may be negative). */
+  async settle(reservation: Reservation, actual: Usage): Promise<RecordResult> {
+    const { cost, unpriced } = this.priceOf(actual);
+    await this.apply(reservation.principal, reservation.windowKey, reservation.ttlMs, {
+      tokens: total(actual) - total(reservation.estimate),
+      usd: cost - reservation.cost,
+      requests: 0,
+    });
+    await this.ledger(reservation.principal, actual, cost, unpriced);
+    return { usage: actual, cost, unpriced };
+  }
+
+  /** Gives a reservation back in full - the call never happened. */
+  async release(reservation: Reservation): Promise<void> {
+    await this.apply(
+      reservation.principal,
+      reservation.windowKey,
+      reservation.ttlMs,
+      { tokens: -total(reservation.estimate), usd: -reservation.cost, requests: -1 },
+      reservation.rateBucket ? { key: reservation.rateBucket, delta: -1, ttl: reservation.ttlMs } : undefined,
+    );
   }
 
   /**
    * The one-liner: checks the budget, runs the call, records its usage.
    * Throws BudgetExceededError before running when over budget. A call
-   * that throws is not recorded.
+   * that throws is not recorded. With `reserve`, the estimate is charged
+   * first and settled to the real usage afterwards.
    */
   async guard<T>(principal: string, fn: () => Promise<T>, options: GuardOptions = {}): Promise<T> {
+    const extract = options.usage ?? detectUsage;
+
+    if (options.reserve) {
+      const reservation = await this.reserve(principal, options.reserve);
+      let result: T;
+      try {
+        result = await fn();
+      } catch (error) {
+        await this.release(reservation);
+        throw error;
+      }
+      await this.settle(reservation, extract(result) ?? options.reserve);
+      return result;
+    }
+
     const decision = await this.check(principal, options.estimateTokens ?? 0);
     if (!decision.allowed) throw new BudgetExceededError(principal, decision.reason!, decision);
     const result = await fn();
-    const usage = (options.usage ?? detectUsage)(result);
+    const usage = extract(result);
     if (usage) await this.record(principal, usage);
     return result;
+  }
+
+  /**
+   * Wraps a provider stream: passes events through and records the usage
+   * the stream reports once it completes. Check the budget before starting
+   * the stream (`check()` or `reserve()`).
+   */
+  meter<T>(principal: string, source: AsyncIterable<T>): AsyncGenerator<T> {
+    return meterStream(source, async (usage) => {
+      if (usage) await this.record(principal, usage);
+    });
   }
 
   /** Current usage against limits without counting anything. */

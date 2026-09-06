@@ -80,8 +80,32 @@ export interface RecordResult {
   unpriced: boolean;
 }
 
+/** One metered call, emitted to `onRecord` for your own ledger/billing table. */
+export interface LedgerEntry {
+  principal: string;
+  usage: Usage;
+  cost: number;
+  unpriced: boolean;
+  /** Epoch ms when the usage was recorded. */
+  at: number;
+}
+
+/** A held estimate; settle it with real usage or release it if the call failed. */
+export interface Reservation {
+  principal: string;
+  estimate: Usage;
+  /** Estimated cost that was charged at reservation time. */
+  cost: number;
+  /** Window key the reservation was charged to, so settlement lands in the same window. */
+  windowKey: string;
+  ttlMs: number;
+  rateBucket?: string;
+}
+
 export interface BudgetOptions {
   store: BudgetStore;
+  /** Called after every record/settle with the metered usage - feed your billing ledger from here. */
+  onRecord?: (entry: LedgerEntry) => void | Promise<void>;
   /** Limits per principal: a constant or a resolver (sync or async). */
   limits: Limits | ((principal: string) => Limits | Promise<Limits>);
   /** Model prices; merged over the built-in table. */
@@ -101,6 +125,13 @@ export interface GuardOptions {
    * token budget before running. Optional but recommended for long prompts.
    */
   estimateTokens?: number;
+  /**
+   * Reserve this estimated usage before the call (charging tokens, cost,
+   * and a request up front), then settle to the real usage afterwards or
+   * release it if the call throws. Closes the overshoot gap for concurrent
+   * calls. Needs a model for the cost estimate.
+   */
+  reserve?: Usage;
   /** Extracts usage from the call's return value (default: OpenAI/Anthropic auto-detect). */
   usage?: (result: unknown) => Usage | null;
 }
