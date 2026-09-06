@@ -1,6 +1,6 @@
 {
   "name": "llm-budget",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Per-user token and dollar budgets, rate limits, and a circuit breaker for LLM API calls - usage metering from OpenAI and Anthropic responses, shared-store adapters for multi-instance SaaS, Express middleware. Zero dependencies.",
   "keywords": [
     "llm",
