@@ -224,7 +224,7 @@ new Budget({
 });
 ```
 
-Model ids resolve leniently: provider prefixes and dated snapshots (`openai/gpt-4o-2024-11-20`) map to the base price. Cached prompt tokens are billed at the cached rate when the table has one. Unknown models record at $0 (`unpriced: true` in the `record()` result) by default; set `unknownModel: 'throw'` to refuse them.
+Model ids resolve leniently: the id is tried as given first, so a table keyed by `openai/gpt-oss-120b` matches that model, then provider prefixes and dated snapshots (`openai/gpt-4o-2024-11-20`) map to the base price. Cached prompt tokens are billed at the cached rate when the table has one. Unknown models record at $0 (`unpriced: true` in the `record()` result) by default; set `unknownModel: 'throw'` to refuse them.
 
 ## Shared storage
 

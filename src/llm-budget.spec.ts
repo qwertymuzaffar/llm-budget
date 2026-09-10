@@ -41,6 +41,22 @@ describe('pricing', () => {
     expect(resolvePrice('totally-unknown', DEFAULT_PRICES)).toBeNull();
   });
 
+  it('matches a provider-prefixed table key by the full model id', () => {
+    const table = { ...DEFAULT_PRICES, 'openai/gpt-oss-120b': { input: 0.15, output: 0.75 } };
+    expect(resolvePrice('openai/gpt-oss-120b', table)).toEqual(table['openai/gpt-oss-120b']);
+    expect(resolvePrice('openai/gpt-oss-120b-2026-01-15', table)).toEqual(table['openai/gpt-oss-120b']);
+    expect(costOf({ model: 'openai/gpt-oss-120b', inputTokens: 1_000_000, outputTokens: 1_000_000 }, table)).toBeCloseTo(0.9, 6);
+  });
+
+  it('prefers a provider-specific key over the bare one for the same model', () => {
+    const azure = { input: 5, output: 20 };
+    const table = { ...DEFAULT_PRICES, 'azure/gpt-4o': azure };
+    expect(resolvePrice('azure/gpt-4o', table)).toEqual(azure);
+    expect(resolvePrice('azure/gpt-4o-2024-11-20', table)).toEqual(azure);
+    expect(resolvePrice('openai/gpt-4o', table)).toEqual(DEFAULT_PRICES['gpt-4o']);
+    expect(resolvePrice('gpt-4o', table)).toEqual(DEFAULT_PRICES['gpt-4o']);
+  });
+
   it('computes cost with cached input at the cached rate', () => {
     // gpt-4o-mini: $0.15 in, $0.6 out, $0.075 cached per 1M
     const cost = costOf({ model: 'gpt-4o-mini', inputTokens: 1_000_000, outputTokens: 1_000_000, cachedInputTokens: 500_000 }, DEFAULT_PRICES);

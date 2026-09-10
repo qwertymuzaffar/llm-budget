@@ -23,19 +23,27 @@ export const DEFAULT_PRICES: PriceTable = {
   'o4-mini': { input: 1.1, output: 4.4, cachedInput: 0.275 },
 };
 
+/** Drops a dated snapshot or "-latest" suffix: "gpt-4o-2024-11-20" -> "gpt-4o". */
+const stripSnapshot = (id: string) => id.replace(/[-@]\d{4}-\d{2}-\d{2}$|[-@]\d{8}$|-latest$/, '');
+
 /**
  * Finds a price for a model id, tolerating provider prefixes and dated
  * snapshots: "openai/gpt-4o-2024-11-20" resolves to "gpt-4o".
+ *
+ * The id is tried as given before the provider prefix is dropped, so a table
+ * keyed by "openai/gpt-oss-120b" matches that model and a provider-specific
+ * key wins over a bare one when both exist.
  */
 export function resolvePrice(model: string, table: PriceTable): ModelPrice | null {
   const bare = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model;
-  if (table[bare]) return table[bare];
-  const stripped = bare.replace(/[-@]\d{4}-\d{2}-\d{2}$|[-@]\d{8}$|-latest$/, '');
-  if (table[stripped]) return table[stripped];
+  for (const candidate of [model, stripSnapshot(model), bare, stripSnapshot(bare)]) {
+    if (table[candidate]) return table[candidate];
+  }
   // longest table key that prefixes the model id (e.g. "gpt-4o" for "gpt-4o-2024-08-06")
   let best: string | null = null;
   for (const key of Object.keys(table)) {
-    if (bare.startsWith(key) && (best === null || key.length > best.length)) best = key;
+    const matches = model.startsWith(key) || bare.startsWith(key);
+    if (matches && (best === null || key.length > best.length)) best = key;
   }
   return best ? table[best] : null;
 }
