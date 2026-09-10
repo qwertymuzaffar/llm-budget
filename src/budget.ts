@@ -37,7 +37,68 @@ export class UnknownModelError extends Error {
 }
 
 const RATE_BUCKET_TTL_FACTOR = 2;
+const DEFAULT_RATE_WINDOW_MS = 60_000;
 const total = (u: Usage) => u.inputTokens + u.outputTokens;
+
+/** The counters that live in the budget window; the rate limit has its own buckets. */
+const WINDOW_METRICS = ['tokens', 'usd', 'requests'] as const;
+type WindowMetric = (typeof WINDOW_METRICS)[number];
+type WindowTotals = Record<WindowMetric, number>;
+
+/** Metrics in the order a check reports the first one that blocks. */
+const BLOCK_ORDER: readonly BudgetReason[] = ['rate', 'requests', 'usd', 'tokens'];
+/** Metrics in the order warnings are listed. */
+const WARN_ORDER: readonly BudgetReason[] = ['tokens', 'usd', 'requests', 'rate'];
+
+/** The sliding-window rate bucket of a frame, present when the limits carry a rate limit. */
+interface RateFrame {
+  perMs: number;
+  /** Start of the bucket that contains `now`. */
+  bucketStart: number;
+  currentKey: string;
+  previousKey: string;
+  ttlMs: number;
+}
+
+/**
+ * A principal's limits and the store keys of its current window, computed
+ * once per operation so every path reads and writes the same keys.
+ */
+interface WindowFrame {
+  limits: Limits;
+  now: number;
+  windowKey: string;
+  /** Epoch ms when the window resets. */
+  resetsAt: number;
+  /** Time to live for the window's counter keys. */
+  ttlMs: number;
+  keys: Record<WindowMetric, string>;
+  rate?: RateFrame;
+}
+
+/** Counter values read from the store for one frame. */
+interface WindowCounters extends WindowTotals {
+  rate: { used: number; resetsAt: number };
+}
+
+/** One write to a window's counters, optionally touching a rate bucket. */
+interface CounterUpdate {
+  windowKey: string;
+  ttlMs: number;
+  deltas: WindowTotals;
+  rate?: { key: string; delta: number; ttlMs: number };
+}
+
+function metricState(used: number, limit: number | undefined, resetsAt: number): MetricState {
+  return {
+    used,
+    limit: limit ?? null,
+    remaining: limit === undefined ? null : Math.max(0, limit - used),
+    resetsAt,
+  };
+}
+
+const atLimit = (metric: MetricState) => metric.limit !== null && metric.used >= metric.limit;
 
 /**
  * Per-principal budgets and rate limits for model calls, backed by a
@@ -68,71 +129,90 @@ export class Budget {
     return `${this.prefix}:${principal}:${metric}:${window}`;
   }
 
-  /** Sliding-window request count: current bucket + weighted previous bucket. */
-  private async rateUsed(principal: string, perMs: number): Promise<{ used: number; resetsAt: number }> {
-    const now = this.clock();
-    const current = Math.floor(now / perMs) * perMs;
-    const previous = current - perMs;
-    const [cur, prev] = await Promise.all([
-      this.store.get(this.key(principal, 'rate', String(current))),
-      this.store.get(this.key(principal, 'rate', String(previous))),
-    ]);
-    const elapsedFraction = (now - current) / perMs;
-    return { used: cur + prev * (1 - elapsedFraction), resetsAt: current + perMs };
+  private windowKeys(principal: string, windowKey: string): Record<WindowMetric, string> {
+    return {
+      tokens: this.key(principal, 'tokens', windowKey),
+      usd: this.key(principal, 'usd', windowKey),
+      requests: this.key(principal, 'requests', windowKey),
+    };
   }
 
-  /** Evaluates the principal's limits. `estimateTokens` is counted against the token budget. */
-  async check(principal: string, estimateTokens = 0): Promise<Decision> {
+  /** Resolves the limits and computes the window and rate-bucket keys as of now. */
+  private async frame(principal: string): Promise<WindowFrame> {
     const limits = await this.resolveLimits(principal);
     const window = limits.window ?? 'month';
     const now = this.clock();
     const { end } = windowBounds(window, now);
-    const wk = windowKey(window, now);
+    const key = windowKey(window, now);
+    const frame: WindowFrame = { limits, now, windowKey: key, resetsAt: end, ttlMs: Math.max(1, end - now), keys: this.windowKeys(principal, key) };
+    if (limits.rate) {
+      const perMs = limits.rate.perMs ?? DEFAULT_RATE_WINDOW_MS;
+      const bucketStart = Math.floor(now / perMs) * perMs;
+      frame.rate = {
+        perMs,
+        bucketStart,
+        currentKey: this.key(principal, 'rate', String(bucketStart)),
+        previousKey: this.key(principal, 'rate', String(bucketStart - perMs)),
+        ttlMs: perMs * RATE_BUCKET_TTL_FACTOR,
+      };
+    }
+    return frame;
+  }
 
-    const [tokens, usd, requests] = await Promise.all([
-      this.store.get(this.key(principal, 'tokens', wk)),
-      this.store.get(this.key(principal, 'usd', wk)),
-      this.store.get(this.key(principal, 'requests', wk)),
-    ]);
-    const rate = limits.rate ? await this.rateUsed(principal, limits.rate.perMs ?? 60_000) : { used: 0, resetsAt: now };
+  /** Sliding-window request count: the current bucket plus the previous one, weighted by how much of it still overlaps. */
+  private rateUsage(frame: WindowFrame, current: number, previous: number): { used: number; resetsAt: number } {
+    if (!frame.rate) return { used: 0, resetsAt: frame.now };
+    const elapsedFraction = (frame.now - frame.rate.bucketStart) / frame.rate.perMs;
+    return { used: current + previous * (1 - elapsedFraction), resetsAt: frame.rate.bucketStart + frame.rate.perMs };
+  }
 
-    const state = (used: number, limit: number | undefined, resetsAt: number): MetricState => ({
-      used,
-      limit: limit ?? null,
-      remaining: limit === undefined ? null : Math.max(0, limit - used),
-      resetsAt,
-    });
+  /** The frame plus its counters, read from the store in one parallel batch. */
+  private async snapshot(principal: string): Promise<{ frame: WindowFrame; counters: WindowCounters }> {
+    const frame = await this.frame(principal);
+    const rateKeys = frame.rate ? [frame.rate.currentKey, frame.rate.previousKey] : [];
+    const values = await Promise.all([...WINDOW_METRICS.map((metric) => frame.keys[metric]), ...rateKeys].map((key) => this.store.get(key)));
+    const [tokens, usd, requests, rateCurrent = 0, ratePrevious = 0] = values;
+    return { frame, counters: { tokens, usd, requests, rate: this.rateUsage(frame, rateCurrent, ratePrevious) } };
+  }
 
+  /** Evaluates the principal's limits. `estimateTokens` is counted against the token budget. */
+  async check(principal: string, estimateTokens = 0): Promise<Decision> {
+    const { frame, counters } = await this.snapshot(principal);
+    const { limits, resetsAt } = frame;
     const decision: Decision = {
       allowed: true,
-      tokens: state(tokens, limits.tokens, end),
-      usd: state(usd, limits.usd, end),
-      requests: state(requests, limits.requests, end),
-      rate: state(rate.used, limits.rate?.requests, rate.resetsAt),
+      tokens: metricState(counters.tokens, limits.tokens, resetsAt),
+      usd: metricState(counters.usd, limits.usd, resetsAt),
+      requests: metricState(counters.requests, limits.requests, resetsAt),
+      rate: metricState(counters.rate.used, limits.rate?.requests, counters.rate.resetsAt),
       warnings: [],
     };
-
-    // A metric blocks once its limit is reached; tokens also block when the
-    // estimated call would push usage past the limit.
-    const atLimit = (m: MetricState) => m.limit !== null && m.used >= m.limit;
-    const checks: Array<[BudgetReason, boolean]> = [
-      ['rate', atLimit(decision.rate)],
-      ['requests', atLimit(decision.requests)],
-      ['usd', atLimit(decision.usd)],
-      ['tokens', atLimit(decision.tokens) || (decision.tokens.limit !== null && tokens + estimateTokens > decision.tokens.limit)],
-    ];
-    for (const [reason, exceeded] of checks) {
-      if (exceeded) {
-        decision.allowed = false;
-        decision.reason = reason;
-        break;
-      }
+    const reason = this.blockingReason(decision, counters.tokens + estimateTokens);
+    if (reason) {
+      decision.allowed = false;
+      decision.reason = reason;
     }
-    for (const reason of ['tokens', 'usd', 'requests', 'rate'] as const) {
-      const m = decision[reason];
-      if (m.limit !== null && m.limit > 0 && m.used / m.limit >= this.warnAt) decision.warnings.push(reason);
-    }
+    decision.warnings = this.warningsFor(decision);
     return decision;
+  }
+
+  /**
+   * The first metric at its limit, in the order rate, requests, usd, tokens.
+   * Tokens also block when the estimated call would push usage past the limit.
+   */
+  private blockingReason(decision: Decision, projectedTokens: number): BudgetReason | undefined {
+    return BLOCK_ORDER.find((reason) => {
+      const metric = decision[reason];
+      return atLimit(metric) || (reason === 'tokens' && metric.limit !== null && projectedTokens > metric.limit);
+    });
+  }
+
+  /** Metrics at or past the warn threshold, in reporting order. */
+  private warningsFor(decision: Decision): BudgetReason[] {
+    return WARN_ORDER.filter((reason) => {
+      const metric = decision[reason];
+      return metric.limit !== null && metric.limit > 0 && metric.used / metric.limit >= this.warnAt;
+    });
   }
 
   private priceOf(usage: Usage): { cost: number; unpriced: boolean } {
@@ -142,37 +222,15 @@ export class Budget {
     return { cost: 0, unpriced: true };
   }
 
-  /** Applies deltas to a window's counters (and optionally a rate bucket). */
-  private async apply(
-    principal: string,
-    wk: string,
-    ttl: number,
-    deltas: { tokens: number; usd: number; requests: number },
-    rateBucket?: { key: string; delta: number; ttl: number },
-  ): Promise<void> {
+  /** Applies the update's deltas to the window's counters (and its rate bucket when given). */
+  private async apply(principal: string, update: CounterUpdate): Promise<void> {
+    const keys = this.windowKeys(principal, update.windowKey);
     const writes: Promise<number>[] = [];
-    if (deltas.tokens !== 0) writes.push(this.store.increment(this.key(principal, 'tokens', wk), deltas.tokens, ttl));
-    if (deltas.usd !== 0) writes.push(this.store.increment(this.key(principal, 'usd', wk), deltas.usd, ttl));
-    if (deltas.requests !== 0) writes.push(this.store.increment(this.key(principal, 'requests', wk), deltas.requests, ttl));
-    if (rateBucket && rateBucket.delta !== 0) writes.push(this.store.increment(rateBucket.key, rateBucket.delta, rateBucket.ttl));
-    await Promise.all(writes);
-  }
-
-  private async windowFor(principal: string): Promise<{ wk: string; ttl: number; rateBucket?: { key: string; ttl: number } }> {
-    const limits = await this.resolveLimits(principal);
-    const window = limits.window ?? 'month';
-    const now = this.clock();
-    const { end } = windowBounds(window, now);
-    const out: { wk: string; ttl: number; rateBucket?: { key: string; ttl: number } } = {
-      wk: windowKey(window, now),
-      ttl: Math.max(1, end - now),
-    };
-    if (limits.rate) {
-      const perMs = limits.rate.perMs ?? 60_000;
-      const bucket = Math.floor(now / perMs) * perMs;
-      out.rateBucket = { key: this.key(principal, 'rate', String(bucket)), ttl: perMs * RATE_BUCKET_TTL_FACTOR };
+    for (const metric of WINDOW_METRICS) {
+      if (update.deltas[metric] !== 0) writes.push(this.store.increment(keys[metric], update.deltas[metric], update.ttlMs));
     }
-    return out;
+    if (update.rate && update.rate.delta !== 0) writes.push(this.store.increment(update.rate.key, update.rate.delta, update.rate.ttlMs));
+    await Promise.all(writes);
   }
 
   private async ledger(principal: string, usage: Usage, cost: number, unpriced: boolean): Promise<void> {
@@ -182,14 +240,13 @@ export class Budget {
   /** Records a completed call's usage and cost against the principal. */
   async record(principal: string, usage: Usage): Promise<RecordResult> {
     const { cost, unpriced } = this.priceOf(usage);
-    const { wk, ttl, rateBucket } = await this.windowFor(principal);
-    await this.apply(
-      principal,
-      wk,
-      ttl,
-      { tokens: total(usage), usd: cost, requests: 1 },
-      rateBucket ? { ...rateBucket, delta: 1 } : undefined,
-    );
+    const { windowKey, ttlMs, rate } = await this.frame(principal);
+    await this.apply(principal, {
+      windowKey,
+      ttlMs,
+      deltas: { tokens: total(usage), usd: cost, requests: 1 },
+      ...(rate ? { rate: { key: rate.currentKey, delta: 1, ttlMs: rate.ttlMs } } : {}),
+    });
     await this.ledger(principal, usage, cost, unpriced);
     return { usage, cost, unpriced };
   }
@@ -203,38 +260,25 @@ export class Budget {
    * settle() (real usage) or release() (call failed).
    */
   async reserve(principal: string, estimate: Usage): Promise<Reservation> {
-    const limits = await this.resolveLimits(principal);
+    const frame = await this.frame(principal);
     const { cost } = this.priceOf(estimate);
-    const { wk, ttl, rateBucket } = await this.windowFor(principal);
     const reservation: Reservation = {
       principal,
       estimate,
       cost,
-      windowKey: wk,
-      ttlMs: ttl,
-      ...(rateBucket ? { rateBucket: rateBucket.key } : {}),
+      windowKey: frame.windowKey,
+      ttlMs: frame.ttlMs,
+      ...(frame.rate ? { rateBucket: frame.rate.currentKey } : {}),
     };
 
     const [tokens, usd, requests, rateCurrent] = await Promise.all([
-      this.store.increment(this.key(principal, 'tokens', wk), total(estimate), ttl),
-      this.store.increment(this.key(principal, 'usd', wk), cost, ttl),
-      this.store.increment(this.key(principal, 'requests', wk), 1, ttl),
-      rateBucket ? this.store.increment(rateBucket.key, 1, rateBucket.ttl) : Promise.resolve(0),
+      this.store.increment(frame.keys.tokens, total(estimate), frame.ttlMs),
+      this.store.increment(frame.keys.usd, cost, frame.ttlMs),
+      this.store.increment(frame.keys.requests, 1, frame.ttlMs),
+      frame.rate ? this.store.increment(frame.rate.currentKey, 1, frame.rate.ttlMs) : Promise.resolve(0),
     ]);
 
-    let reason: BudgetReason | null = null;
-    if (limits.rate && rateBucket) {
-      const perMs = limits.rate.perMs ?? 60_000;
-      const now = this.clock();
-      const current = Math.floor(now / perMs) * perMs;
-      const prev = await this.store.get(this.key(principal, 'rate', String(current - perMs)));
-      const used = rateCurrent + prev * (1 - (now - current) / perMs);
-      if (used > limits.rate.requests) reason = 'rate';
-    }
-    if (!reason && limits.requests !== undefined && requests > limits.requests) reason = 'requests';
-    if (!reason && limits.usd !== undefined && usd > limits.usd) reason = 'usd';
-    if (!reason && limits.tokens !== undefined && tokens > limits.tokens) reason = 'tokens';
-
+    const reason = await this.overshoot(frame, { tokens, usd, requests }, rateCurrent);
     if (reason) {
       await this.release(reservation);
       throw new BudgetExceededError(principal, reason, await this.check(principal, total(estimate)));
@@ -242,13 +286,26 @@ export class Budget {
     return reservation;
   }
 
+  /** The first limit the incremented totals pass, in the order rate, requests, usd, tokens. */
+  private async overshoot(frame: WindowFrame, totals: WindowTotals, rateCurrent: number): Promise<BudgetReason | undefined> {
+    const { limits } = frame;
+    if (frame.rate && limits.rate) {
+      const ratePrevious = await this.store.get(frame.rate.previousKey);
+      if (this.rateUsage(frame, rateCurrent, ratePrevious).used > limits.rate.requests) return 'rate';
+    }
+    if (limits.requests !== undefined && totals.requests > limits.requests) return 'requests';
+    if (limits.usd !== undefined && totals.usd > limits.usd) return 'usd';
+    if (limits.tokens !== undefined && totals.tokens > limits.tokens) return 'tokens';
+    return undefined;
+  }
+
   /** Replaces a reservation's estimate with the real usage (deltas may be negative). */
   async settle(reservation: Reservation, actual: Usage): Promise<RecordResult> {
     const { cost, unpriced } = this.priceOf(actual);
-    await this.apply(reservation.principal, reservation.windowKey, reservation.ttlMs, {
-      tokens: total(actual) - total(reservation.estimate),
-      usd: cost - reservation.cost,
-      requests: 0,
+    await this.apply(reservation.principal, {
+      windowKey: reservation.windowKey,
+      ttlMs: reservation.ttlMs,
+      deltas: { tokens: total(actual) - total(reservation.estimate), usd: cost - reservation.cost, requests: 0 },
     });
     await this.ledger(reservation.principal, actual, cost, unpriced);
     return { usage: actual, cost, unpriced };
@@ -256,13 +313,12 @@ export class Budget {
 
   /** Gives a reservation back in full - the call never happened. */
   async release(reservation: Reservation): Promise<void> {
-    await this.apply(
-      reservation.principal,
-      reservation.windowKey,
-      reservation.ttlMs,
-      { tokens: -total(reservation.estimate), usd: -reservation.cost, requests: -1 },
-      reservation.rateBucket ? { key: reservation.rateBucket, delta: -1, ttl: reservation.ttlMs } : undefined,
-    );
+    await this.apply(reservation.principal, {
+      windowKey: reservation.windowKey,
+      ttlMs: reservation.ttlMs,
+      deltas: { tokens: -total(reservation.estimate), usd: -reservation.cost, requests: -1 },
+      ...(reservation.rateBucket ? { rate: { key: reservation.rateBucket, delta: -1, ttlMs: reservation.ttlMs } } : {}),
+    });
   }
 
   /**
